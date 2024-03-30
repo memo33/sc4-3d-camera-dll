@@ -62,10 +62,6 @@ static constexpr uint32_t kCameraDllDirectorID = 0x23B41621;
 
 static constexpr std::string_view PluginLogFileName = "memo.3dcamera.log";
 
-static constexpr uint32_t UpdateCameraZoomAndRotationParams_InjectPoint = 0x7cbeaa;
-static constexpr uint32_t UpdateCameraZoomAndRotationParams_ContinueJump = 0x7cbeb0;
-static constexpr uint32_t cSC4CameraControl_UpdateCameraPosition = 0x7ccf80;
-
 static constexpr uint32_t yawAddress0 = 0x7ccb0a;
 static constexpr uint32_t yawAddress1 = 0xabcfc4;
 static constexpr uint32_t yawAddress2 = 0xabacb8;
@@ -75,9 +71,7 @@ static constexpr uint32_t pitchAddress2 = 0xabaccc;
 static constexpr int numZooms = 5;
 static const float_t pitchRadDefault[numZooms] = {0.52359879f, 0.61086524f, 0.69813168f, 0.78539819f, 0.78539819f};
 static constexpr float_t yawRadDefault = -0.39269909;
-static float_t sYawRad = yawRadDefault;
 static constexpr float_t tol = 0.001;
-static bool sInstalledPatches = false;
 
 namespace
 {
@@ -121,53 +115,20 @@ namespace
 		*((float_t*)address) = newValue;
 	}
 
-	void InstallHook(uint32_t address, void (*pfnFunc)(void))
-	{
-		DWORD oldProtect;
-		THROW_IF_WIN32_BOOL_FALSE(VirtualProtect((void *)address, 5, PAGE_EXECUTE_READWRITE, &oldProtect));
+	typedef bool(__thiscall* pfn_cSC4CameraControl_UpdateCameraPosition)(cSC4CameraControl* pThis, uint32_t updateMode);
 
-		*((uint8_t*)address) = 0xE9;
-		*((uint32_t*)(address+1)) = ((uint32_t)pfnFunc) - address - 5;
-	}
-
-	void Call_UpdateCameraPosition(cSC4CameraControl* cameraControl, uint32_t updateMode)
-	{
-		__asm {
-			push dword ptr [updateMode];
-			mov ecx, dword ptr [cameraControl];  // (this)
-			mov eax, dword ptr [cSC4CameraControl_UpdateCameraPosition];
-			call eax;  // (thiscall)
-		}
-	}
-
-	void NAKED_FUN Hook_UpdateCameraZoomAndRotationParams(void)
-	{
-		__asm {
-			fadd dword ptr [sYawRad];
-			push UpdateCameraZoomAndRotationParams_ContinueJump;
-			ret;
-		}
-	}
-
-	void InstallPatches()
-	{
-		Logger& logger = Logger::GetInstance();
-		try
-		{
-			InstallHook(UpdateCameraZoomAndRotationParams_InjectPoint, Hook_UpdateCameraZoomAndRotationParams);
-			logger.WriteLine(
-				LogLevel::Info,
-				"Installed 3D-Camera patch.");
-		}
-		catch (const wil::ResultException& e)
-		{
-			logger.WriteLineFormatted(
-				LogLevel::Error,
-				"Failed to install the 3D-Camera patch.\n%s",
-				e.what());
-		}
-	}
+	static pfn_cSC4CameraControl_UpdateCameraPosition UpdateCameraPosition = reinterpret_cast<pfn_cSC4CameraControl_UpdateCameraPosition>(0x7ccf80);
 }
+
+class cSC4CameraControl
+{
+	public:
+		void* vtable;
+		intptr_t unknown[0x45];
+		float_t yaw;
+		float_t pitch;
+};
+static_assert(offsetof(cSC4CameraControl, yaw) == 0x118);
 
 class CameraDllDirector final : public cRZMessage2COMDirector
 {
@@ -256,7 +217,7 @@ public:
 		}
 	}
 
-	void UpdateCamera()
+	template <typename F> void UseCameraControl(F&& callback)
 	{
 		cISC4AppPtr pSC4App;
 		if (pSC4App) {
@@ -270,11 +231,10 @@ public:
 						if (renderer) {
 							cSC4CameraControl* cameraControl = renderer->GetCameraControl();
 							if (cameraControl) {
-								uint32_t updateMode = 2;
-								Call_UpdateCameraPosition(cameraControl, updateMode);
+								callback(cameraControl);
 							} else {
 								Logger& logger = Logger::GetInstance();
-								logger.WriteLine(LogLevel::Error, "Failed to obtain camera. Manually change zoom/rotation instead to update view.");
+								logger.WriteLine(LogLevel::Error, "Failed to obtain camera.");
 							}
 						}
 						pView3D->Release();
@@ -284,13 +244,16 @@ public:
 		}
 	}
 
+	void UpdateCamera()
+	{
+		UseCameraControl([](cSC4CameraControl* cameraControl) {
+			uint32_t updateMode = 2;
+			UpdateCameraPosition(cameraControl, updateMode);
+		});
+	}
+
 	void ProcessCheat(cIGZMessage2Standard* pStandardMsg)
 	{
-		if (!sInstalledPatches) {
-			InstallPatches();
-			sInstalledPatches = true;
-		}
-
 		uint32_t cheatID = static_cast<uint32_t>(pStandardMsg->GetData1());
 		if (cheatID == kPitchAngleCheatID)
 		{
@@ -312,11 +275,14 @@ public:
 			cIGZString* cheatStr = static_cast<cIGZString*>(pStandardMsg->GetVoid2());
 			std::vector<float_t> angles;
 			if (ParseCheatString(cheatStr->ToChar(), &angles, 1)) {
-				sYawRad = angles.size() >= 1 ? -deg2rad(angles[0]) : yawRadDefault;
-				OverwriteMemoryFloat((void*)yawAddress0, sYawRad);
+				float_t yawRad = angles.empty() ? yawRadDefault : -deg2rad(angles[0]);
+				UseCameraControl([yawRad](cSC4CameraControl* cameraControl) {
+					cameraControl->yaw = yawRad;
+				});
+				OverwriteMemoryFloat((void*)yawAddress0, yawRad);
 				for (int i = 0; i < 5; i++) {
-					OverwriteMemoryFloat((void*)(yawAddress1 + i*4), sYawRad);
-					OverwriteMemoryFloat((void*)(yawAddress2 + i*4), sYawRad);
+					OverwriteMemoryFloat((void*)(yawAddress1 + i*4), yawRad);
+					OverwriteMemoryFloat((void*)(yawAddress2 + i*4), yawRad);
 				}
 				UpdateCamera();
 			}  // else invalid cheat arguments
